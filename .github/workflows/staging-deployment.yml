@@ -1,0 +1,146 @@
+name: Staging deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netlify-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy staging
+    runs-on: ubuntu-24.04
+    environment: staging
+
+    steps:
+      - name: Checkout selected branch
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build static Next.js application
+        run: npm run build
+
+      - name: Verify static export
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/index.html || {
+            echo "::error::Missing dist/index.html. Check Next.js static export configuration."
+            exit 1
+          }
+
+      - name: Find or create Netlify staging site
+        id: netlify-site
+        shell: bash
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_TEAM_SLUG: ${{ vars.NETLIFY_TEAM_SLUG }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+
+          SITE_NAME="$(printf '%s' "$REPOSITORY_NAME" \
+            | tr '[:upper:]' '[:lower:]')-test"
+
+          if [[ ! "$SITE_NAME" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+            echo "::error::Invalid Netlify site name: $SITE_NAME"
+            exit 1
+          fi
+
+          if [[ -z "$NETLIFY_AUTH_TOKEN" ]]; then
+            echo "::error::Missing NETLIFY_AUTH_TOKEN secret."
+            exit 1
+          fi
+
+          API_URL="https://api.netlify.com/api/v1/sites"
+
+          echo "Searching for Netlify site: $SITE_NAME"
+
+          RESPONSE="$(curl --fail-with-body --silent --show-error \
+            --get "$API_URL" \
+            --header "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+            --data-urlencode "name=$SITE_NAME" \
+            --data-urlencode "filter=all" \
+            --data-urlencode "per_page=100")"
+
+          SITE_COUNT="$(printf '%s' "$RESPONSE" | jq \
+            --arg name "$SITE_NAME" \
+            '[.[] | select(.name == $name)] | length')"
+
+          if [[ "$SITE_COUNT" -gt 1 ]]; then
+            echo "::error::Multiple sites named $SITE_NAME were found. Refusing to deploy."
+            exit 1
+          fi
+
+          if [[ "$SITE_COUNT" -eq 1 ]]; then
+            SITE_ID="$(printf '%s' "$RESPONSE" | jq -er \
+              --arg name "$SITE_NAME" \
+              '.[] | select(.name == $name) | .id')"
+
+            echo "Using existing site: $SITE_NAME"
+          else
+            echo "Site not found. Creating $SITE_NAME"
+
+            if [[ -n "${NETLIFY_TEAM_SLUG:-}" ]]; then
+              CREATE_PAYLOAD="$(jq -n \
+                --arg name "$SITE_NAME" \
+                --arg account_slug "$NETLIFY_TEAM_SLUG" \
+                '{name: $name, account_slug: $account_slug}')"
+            else
+              CREATE_PAYLOAD="$(jq -n \
+                --arg name "$SITE_NAME" \
+                '{name: $name}')"
+            fi
+
+            CREATE_RESPONSE="$(curl --fail-with-body --silent --show-error \
+              --request POST "$API_URL" \
+              --header "Authorization: Bearer $NETLIFY_AUTH_TOKEN" \
+              --header "Content-Type: application/json" \
+              --data "$CREATE_PAYLOAD")"
+
+            SITE_ID="$(printf '%s' "$CREATE_RESPONSE" | jq -er '.id')"
+
+            echo "Created site: $SITE_NAME"
+          fi
+
+          if [[ -z "$SITE_ID" || "$SITE_ID" == "null" ]]; then
+            echo "::error::Could not resolve Netlify site ID."
+            exit 1
+          fi
+
+          echo "site_id=$SITE_ID" >> "$GITHUB_OUTPUT"
+          echo "site_name=$SITE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to Netlify staging
+        shell: bash
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ steps.netlify-site.outputs.site_id }}
+        run: |
+          set -euo pipefail
+
+          npx --yes netlify-cli@latest deploy \
+            --site="$NETLIFY_SITE_ID" \
+            --dir=dist \
+            --no-build \
+            --prod \
+            --auth="$NETLIFY_AUTH_TOKEN"
+
+      - name: Print staging URL
+        env:
+          SITE_NAME: ${{ steps.netlify-site.outputs.site_name }}
+        shell: bash
+        run: |
+          echo "Staging URL: https://${SITE_NAME}.netlify.app"

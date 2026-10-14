@@ -1,0 +1,11 @@
+# compiled output
+**/node_modules
+
+# Next.js
+.next
+/.next/
+/out/
+/dist/
+
+# environment variable files
+.env

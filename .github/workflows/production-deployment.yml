@@ -1,0 +1,55 @@
+name: Production deployment
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy to OVHcloud
+    runs-on: ubuntu-24.04
+    environment: production
+
+    steps:
+      - name: Checkout production branch
+        uses: actions/checkout@v6
+        with:
+          ref: main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build static Next.js application
+        run: npm run build
+
+      - name: Prepare deployment directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f dist/index.html || {
+            echo "::error::Missing dist/index.html. Check Next.js static export configuration."
+            exit 1
+          }
+
+      - name: Deploy static files via SFTP
+        uses: Dylan700/sftp-upload-action@v1.2.5
+        with:
+          server: ${{ secrets.SFTP_SERVER }}
+          username: ${{ secrets.SFTP_USERNAME }}
+          password: ${{ secrets.SFTP_PASSWORD }}
+          port: 22
+          uploads: |
+            ./dist/ => ${{ secrets.SFTP_SERVER_DIR }}
+          delete: false
